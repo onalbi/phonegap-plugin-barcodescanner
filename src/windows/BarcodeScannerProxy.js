@@ -12,6 +12,7 @@ var urlutil = require('cordova/urlutil');
 
 var CAMERA_STREAM_STATE_CHECK_RETRY_TIMEOUT = 200; // milliseconds
 var OPERATION_IS_IN_PROGRESS = -2147024567;
+var REGDB_E_CLASSNOTREG = -2147221164;
 var INITIAL_FOCUS_DELAY = 200; // milliseconds
 var CHECK_PLAYING_TIMEOUT = 100; // milliseconds
 
@@ -155,6 +156,22 @@ BarcodeReader.prototype.init = function (capture, width, height) {
     this._width = width;
     this._height = height;
     this._zxingReader = new ZXing.BarcodeReader();
+    this._zxingReader.tryHarder = true;
+
+    var formatsList = BarcodeReader.scanCallArgs.args.length > 0 && BarcodeReader.scanCallArgs.args[0].formats;	
+	if (formatsList) {		
+        var possibleFormats = formatsList
+            .split(",")
+            .map(format => {
+                for (var index in BARCODE_FORMAT) {
+                    if (BARCODE_FORMAT[index] === format) {                        
+                        return index;
+                    }
+                }
+            });
+
+        this._zxingReader.possibleFormats = possibleFormats;
+    }
 };
 
 /**
@@ -343,8 +360,14 @@ module.exports = {
             }
 
             // Multiple calls to focusAsync leads to internal focusing hang on some Windows Phone 8.1 devices
-            if (controller.focusControl.focusState === Windows.Media.Devices.MediaCaptureFocusState.searching) {
-                return result;
+            // Also need to wrap in try/catch to avoid crash on Surface 3 - looks like focusState property
+            // somehow is not accessible there. See https://github.com/phonegap/phonegap-plugin-barcodescanner/issues/288
+            try {
+                if (controller.focusControl.focusState === Windows.Media.Devices.MediaCaptureFocusState.searching) {
+                    return result;
+                }
+            } catch (e) {
+                // Nothing to do - just continue w/ focusing
             }
 
             // The delay prevents focus hang on slow devices
@@ -399,7 +422,7 @@ module.exports = {
 
             focusControl.configure(focusConfig);
 
-            // Continuous focus should start only after preview has started. See 'Remarks' at 
+            // Continuous focus should start only after preview has started. See 'Remarks' at
             // https://msdn.microsoft.com/en-us/library/windows/apps/windows.media.devices.focuscontrol.configure.aspx
             function waitForIsPlaying() {
                 var isPlaying = !capturePreview.paused && !capturePreview.ended && capturePreview.readyState > 2;
@@ -433,7 +456,18 @@ module.exports = {
         function startPreview() {
             return findCamera()
             .then(function (id) {
-                var captureSettings = new Windows.Media.Capture.MediaCaptureInitializationSettings();
+                var captureSettings;
+
+                try {
+                    captureSettings = new Windows.Media.Capture.MediaCaptureInitializationSettings();
+                } catch (e) {
+                    if (e.number === REGDB_E_CLASSNOTREG) {
+                        throw new Error('Ensure that you have Windows Media Player and Media Feature pack installed.');
+                    }
+
+                    throw e;
+                }
+
                 captureSettings.streamingCaptureMode = Windows.Media.Capture.StreamingCaptureMode.video;
                 captureSettings.photoCaptureSource = Windows.Media.Capture.PhotoCaptureSource.videoPreview;
                 captureSettings.videoDeviceId = id;
@@ -444,7 +478,7 @@ module.exports = {
             .then(function () {
 
                 var controller = capture.videoDeviceController;
-                var deviceProps = controller.getAvailableMediaStreamProperties(Windows.Media.Capture.MediaStreamType.videoRecord);
+                var deviceProps = controller.getAvailableMediaStreamProperties(Windows.Media.Capture.MediaStreamType.videoPreview);
 
                 deviceProps = Array.prototype.slice.call(deviceProps);
                 deviceProps = deviceProps.filter(function (prop) {
@@ -455,8 +489,15 @@ module.exports = {
                     return propB.width - propA.width;
                 });
 
-                var maxResProps = deviceProps[0];
-                return controller.setMediaStreamPropertiesAsync(Windows.Media.Capture.MediaStreamType.videoRecord, maxResProps)
+                var preferredProps = deviceProps.filter(function(prop){
+                    // Filter out props where frame size is between 640*480 and 1280*720
+                    return prop.width >= 640 && prop.height >= 480 && prop.width <= 1280 && prop.height <= 720;
+                });
+
+                // prefer video frame size between between 640*480 and 1280*720
+                // use maximum resolution otherwise
+                var maxResProps = preferredProps[0] || deviceProps[0];
+                return controller.setMediaStreamPropertiesAsync(Windows.Media.Capture.MediaStreamType.videoPreview, maxResProps)
                 .then(function () {
                     return {
                         capture: capture,
@@ -520,11 +561,26 @@ module.exports = {
             Windows.Graphics.Display.DisplayInformation.getForCurrentView().removeEventListener("orientationchanged", updatePreviewForRotation, false);
             document.removeEventListener('backbutton', cancelPreview);
 
-            capturePreview.pause();
-            capturePreview.src = null;
+            if (capturePreview) {
+                var isPlaying = !capturePreview.paused && !capturePreview.ended && capturePreview.readyState > 2;
+                if (isPlaying) {
+                    capturePreview.pause();
+                }
+
+                // http://stackoverflow.com/a/28060352/4177762
+                capturePreview.src = "";
+                if (capturePreview.load) {
+                    capturePreview.load();
+                }
+            }
 
             if (capturePreviewFrame) {
-                document.body.removeChild(capturePreviewFrame);
+                try {
+                    document.body.removeChild(capturePreviewFrame);
+                } catch (e) {
+                    // Catching NotFoundError
+                    console.error(e);
+                }
             }
             capturePreviewFrame = null;
 
@@ -532,7 +588,12 @@ module.exports = {
             reader = null;
 
             if (capture) {
-                promise = capture.stopRecordAsync();
+                try {
+                    promise = capture.stopRecordAsync();
+                } catch (e) {
+                    // Catching NotFoundError
+                    console.error(e);
+                }
             }
             capture = null;
 
@@ -551,13 +612,15 @@ module.exports = {
         }
 
         function checkCancelled() {
-            if (BarcodeReader.scanCancelled) {
+            if (BarcodeReader.scanCancelled || BarcodeReader.suspended) {
                 throw new Error('Canceled');
             }
         }
 
-        BarcodeReader.scanPromise = WinJS.Promise.wrap(createPreview())
-        .then(function () {
+        // Timeout is needed so that the .done finalizer below can be attached to the promise.
+        BarcodeReader.scanPromise = WinJS.Promise.timeout()
+        .then(function() {
+            createPreview();
             checkCancelled();
             return startPreview();
         })
@@ -586,9 +649,16 @@ module.exports = {
                 format: result && BARCODE_FORMAT[result.barcodeFormat],
                 cancelled: !result
             });
-        }, function (error) {
-            destroyPreview();
+        });
 
+        // Catching any errors here
+        BarcodeReader.scanPromise.done(function () { }, function (error) {
+            // Suppress null result (cancel) on suspending
+            if (BarcodeReader.suspended) {
+                return;
+            }
+
+            destroyPreview();
             if (error.message == 'Canceled') {
                 success({
                     cancelled: true
@@ -622,20 +692,46 @@ function waitForScanEnd() {
     return BarcodeReader.scanPromise || WinJS.Promise.as();
 }
 
+function suspend(args) {
+    BarcodeReader.suspended = true;
+    if (args) {
+        args.setPromise(BarcodeReader.destroyPreview()
+        .then(waitForScanEnd, waitForScanEnd));
+    } else {
+        BarcodeReader.destroyPreview();
+    }
+}
+
+function resume() {
+    BarcodeReader.suspended = false;
+    module.exports.scan(BarcodeReader.scanCallArgs.success, BarcodeReader.scanCallArgs.fail, BarcodeReader.scanCallArgs.args);
+}
+
+function onVisibilityChanged() {
+    if (document.visibilityState === 'hidden'
+        && BarcodeReader.videoPreviewIsVisible && BarcodeReader.videoPreviewIsVisible() && BarcodeReader.destroyPreview) {
+        suspend();
+    } else if (BarcodeReader.suspended) {
+        resume();
+    }
+}
+
+// Windows 8.1 projects
+document.addEventListener('msvisibilitychange', onVisibilityChanged);
+// Windows 10 projects
+document.addEventListener('visibilitychange', onVisibilityChanged);
+
 // About to be suspended
 app.addEventListener('checkpoint', function (args) {
     if (BarcodeReader.videoPreviewIsVisible && BarcodeReader.videoPreviewIsVisible() && BarcodeReader.destroyPreview) {
-        BarcodeReader.suspended = true;
-        args.setPromise(BarcodeReader.destroyPreview()
-        .then(waitForScanEnd, waitForScanEnd));
+        suspend(args);
     }
 });
 
 // Resuming from a user suspension
 Windows.UI.WebUI.WebUIApplication.addEventListener("resuming", function () {
     if (BarcodeReader.suspended) {
-        BarcodeReader.suspended = false;
-        module.exports.scan(BarcodeReader.scanCallArgs.success, BarcodeReader.scanCallArgs.fail, BarcodeReader.scanCallArgs.args);
+        resume();
     }
 }, false);
 
